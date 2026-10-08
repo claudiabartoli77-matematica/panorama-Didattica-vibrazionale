@@ -1,0 +1,341 @@
+<!--
+  ============================================================
+  PANORAMA 360° VIEWER — componente integrabile
+  ============================================================
+  Porzione di HTML/JS pensata per essere incollata dentro
+  l'index (o un componente) di un'app che deve mostrare
+  immagini equirettangolari esplorabili a 360°.
+
+  Dipendenza: Three.js (r128) via CDN — un solo <script>.
+  Nessun bundler, nessun framework richiesto.
+
+  COME INTEGRARLA:
+  1. Copia il blocco <div id="panorama-container">...</div>
+  2. Copia il <style> (puoi rinominare le classi se servono
+     scope diversi, es. dentro un componente React/Vue)
+  3. Copia lo <script> con la classe PanoramaViewer
+  4. Istanzia: new PanoramaViewer('id-contenitore', 'url-immagine.jpg')
+
+  PARAMETRI CONFIGURABILI (vedi sezione "new PanoramaViewer"
+  in fondo al file per un esempio con tutte le opzioni):
+    - pitchLimit : limite verticale in gradi (default 70 → -70/+70)
+    - fov        : campo visivo iniziale (zoom di partenza)
+    - minFov/maxFov : limiti dello zoom
+    - autoRotate : rotazione automatica lenta quando inattivo (bool)
+  ============================================================
+-->
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visore panoramico 360° — demo</title>
+<style>
+  /* ---- stili minimi della pagina demo (rimuovibili in integrazione) ---- */
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0e0f0c;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .demo-wrap { display: flex; flex-direction: column; height: 100%; }
+  .demo-header {
+    padding: 14px 20px;
+    color: #e8e4d6;
+    background: #16180f;
+    border-bottom: 1px solid #2a2d1f;
+    font-size: 14px;
+  }
+  .demo-header strong { color: #c9a24b; }
+
+  /* ============================================================
+     BLOCCO INTEGRABILE — da qui in giù è la parte da riusare
+     ============================================================ */
+  .panorama-viewer {
+    position: relative;
+    width: 100%;
+    flex: 1;
+    min-height: 320px;
+    background: #000;
+    overflow: hidden;
+    touch-action: none; /* evita lo scroll della pagina durante il drag */
+    cursor: grab;
+  }
+  .panorama-viewer.is-dragging { cursor: grabbing; }
+  .panorama-viewer canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  .panorama-hint {
+    position: absolute;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    padding: 6px 14px;
+    background: rgba(14, 15, 12, 0.55);
+    color: #f2eee0;
+    font-size: 12.5px;
+    letter-spacing: 0.01em;
+    border-radius: 999px;
+    pointer-events: none;
+    transition: opacity 0.6s ease;
+  }
+  .panorama-hint.is-hidden { opacity: 0; }
+  .panorama-zoom-controls {
+    position: absolute;
+    right: 14px;
+    bottom: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .panorama-zoom-controls button {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(14, 15, 12, 0.55);
+    color: #f2eee0;
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .panorama-zoom-controls button:hover { background: rgba(14, 15, 12, 0.8); }
+</style>
+</head>
+<body>
+<div class="demo-wrap">
+  <div class="demo-header">
+    <strong>Visore 360°</strong> — trascina per guardarti intorno, rotellina/pinch per zoomare.
+    Limite verticale impostato a ±70°.
+  </div>
+
+  <!-- Contenitore del panorama: unico elemento richiesto nel markup -->
+  <div id="panorama-container" class="panorama-viewer">
+    <div class="panorama-hint" id="panorama-hint">trascina per esplorare · scorri per zoomare</div>
+    <div class="panorama-zoom-controls">
+      <button id="pv-zoom-in" aria-label="Zoom avanti">+</button>
+      <button id="pv-zoom-out" aria-label="Zoom indietro">−</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/**
+ * PanoramaViewer
+ * Visore per immagini equirettangolari (360°) basato su Three.js:
+ * proietta l'immagine sull'interno di una sfera e muove una camera
+ * al centro. Il "drag" ruota la camera; la rotellina/pinch cambia
+ * il FOV (effetto zoom).
+ */
+class PanoramaViewer {
+  constructor(containerId, imageUrl, options = {}) {
+    this.container = document.getElementById(containerId);
+    if (!this.container) {
+      console.error('PanoramaViewer: contenitore non trovato:', containerId);
+      return;
+    }
+    this.imageUrl = imageUrl;
+
+    // ---- opzioni con default ----
+    this.pitchLimit = options.pitchLimit ?? 70;   // gradi, verticale: -limit/+limit
+    this.fov        = options.fov ?? 75;          // campo visivo iniziale
+    this.minFov     = options.minFov ?? 30;        // zoom massimo (in avanti)
+    this.maxFov     = options.maxFov ?? 100;       // zoom minimo (indietro)
+    this.lon        = options.startLon ?? 0;       // orientamento orizzontale iniziale
+    this.lat        = options.startLat ?? 0;       // orientamento verticale iniziale
+    this.autoRotate = options.autoRotate ?? false;
+    this.autoRotateSpeed = options.autoRotateSpeed ?? 0.02; // gradi/frame
+
+    this._isPointerDown = false;
+    this._pointerId = null;
+    this._lastX = 0;
+    this._lastY = 0;
+    this._pinchStartDist = null;
+    this._pinchStartFov = null;
+    this._idleTimer = null;
+
+    this._initScene();
+    this._loadTexture();
+    this._bindEvents();
+    this._animate();
+  }
+
+  _initScene() {
+    const { clientWidth: w, clientHeight: h } = this.container;
+
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(this.fov, w / h, 1, 1100);
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer.setSize(w, h);
+    this.container.appendChild(this.renderer.domElement);
+
+    // Sfera "invertita" (scale negativa su X) per vedere la texture
+    // dall'interno, con abbastanza segmenti da evitare distorsioni.
+    const geometry = new THREE.SphereGeometry(500, 60, 40);
+    geometry.scale(-1, 1, 1);
+    this._placeholderMaterial = new THREE.MeshBasicMaterial({ color: 0x111111 });
+    this.mesh = new THREE.Mesh(geometry, this._placeholderMaterial);
+    this.scene.add(this.mesh);
+  }
+
+  _loadTexture() {
+    new THREE.TextureLoader().load(this.imageUrl, (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace ?? texture.colorSpace;
+      this.mesh.material = new THREE.MeshBasicMaterial({ map: texture });
+      this._placeholderMaterial.dispose();
+    });
+  }
+
+  _bindEvents() {
+    const el = this.container;
+
+    // ---- resize responsive ----
+    this._resizeObserver = new ResizeObserver(() => this._onResize());
+    this._resizeObserver.observe(el);
+
+    // ---- drag con mouse/touch (Pointer Events copre entrambi) ----
+    el.addEventListener('pointerdown', (e) => this._onPointerDown(e));
+    window.addEventListener('pointermove', (e) => this._onPointerMove(e));
+    window.addEventListener('pointerup', (e) => this._onPointerUp(e));
+
+    // ---- zoom con rotellina ----
+    el.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
+
+    // ---- pinch-to-zoom su touch (due dita) ----
+    el.addEventListener('touchstart', (e) => this._onTouchStart(e), { passive: false });
+    el.addEventListener('touchmove', (e) => this._onTouchMove(e), { passive: false });
+
+    // ---- pulsanti zoom opzionali ----
+    const zoomInBtn = document.getElementById('pv-zoom-in');
+    const zoomOutBtn = document.getElementById('pv-zoom-out');
+    if (zoomInBtn) zoomInBtn.addEventListener('click', () => this._applyZoom(-10));
+    if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => this._applyZoom(10));
+
+    // ---- nasconde il suggerimento dopo la prima interazione ----
+    this._hint = document.getElementById('panorama-hint');
+  }
+
+  _onResize() {
+    const { clientWidth: w, clientHeight: h } = this.container;
+    if (!w || !h) return;
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+  }
+
+  _onPointerDown(e) {
+    this._isPointerDown = true;
+    this._pointerId = e.pointerId;
+    this._lastX = e.clientX;
+    this._lastY = e.clientY;
+    this.container.classList.add('is-dragging');
+    this._markInteracted();
+  }
+
+  _onPointerMove(e) {
+    if (!this._isPointerDown || e.pointerId !== this._pointerId) return;
+    const dx = e.clientX - this._lastX;
+    const dy = e.clientY - this._lastY;
+    this._lastX = e.clientX;
+    this._lastY = e.clientY;
+
+    // sensibilità proporzionale al fov corrente: più sei zoomato,
+    // più il drag è "fine"
+    const sensitivity = 0.12 * (this.fov / 75);
+    this.lon -= dx * sensitivity;
+    this.lat += dy * sensitivity;
+
+    // --- limite di visuale verticale richiesto: -70° / +70° ---
+    this.lat = Math.max(-this.pitchLimit, Math.min(this.pitchLimit, this.lat));
+  }
+
+  _onPointerUp(e) {
+    if (e.pointerId !== this._pointerId) return;
+    this._isPointerDown = false;
+    this.container.classList.remove('is-dragging');
+  }
+
+  _onWheel(e) {
+    e.preventDefault();
+    this._applyZoom(e.deltaY * 0.05);
+    this._markInteracted();
+  }
+
+  _onTouchStart(e) {
+    if (e.touches.length === 2) {
+      this._pinchStartDist = this._touchDistance(e.touches);
+      this._pinchStartFov = this.fov;
+    }
+    this._markInteracted();
+  }
+
+  _onTouchMove(e) {
+    if (e.touches.length === 2 && this._pinchStartDist) {
+      e.preventDefault();
+      const dist = this._touchDistance(e.touches);
+      const scale = this._pinchStartDist / dist;
+      this.fov = this._clampFov(this._pinchStartFov * scale);
+      this.camera.fov = this.fov;
+      this.camera.updateProjectionMatrix();
+    }
+  }
+
+  _touchDistance(touches) {
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  _applyZoom(delta) {
+    this.fov = this._clampFov(this.fov + delta);
+    this.camera.fov = this.fov;
+    this.camera.updateProjectionMatrix();
+  }
+
+  _clampFov(value) {
+    return Math.max(this.minFov, Math.min(this.maxFov, value));
+  }
+
+  _markInteracted() {
+    if (this._hint && !this._hint.classList.contains('is-hidden')) {
+      this._hint.classList.add('is-hidden');
+    }
+  }
+
+  _animate() {
+    requestAnimationFrame(() => this._animate());
+
+    if (this.autoRotate && !this._isPointerDown) {
+      this.lon += this.autoRotateSpeed;
+    }
+
+    // conversione lon/lat (gradi) in un punto target sulla sfera
+    const phi = THREE.MathUtils.degToRad(90 - this.lat);
+    const theta = THREE.MathUtils.degToRad(this.lon);
+
+    const target = new THREE.Vector3(
+      500 * Math.sin(phi) * Math.cos(theta),
+      500 * Math.cos(phi),
+      500 * Math.sin(phi) * Math.sin(theta)
+    );
+    this.camera.lookAt(target);
+    this.renderer.render(this.scene, this.camera);
+  }
+}
+
+// ============================================================
+// ISTANZA DI ESEMPIO — sostituisci l'URL con l'immagine da usare
+// ============================================================
+new PanoramaViewer('panorama-container', '01-radura.webp', {
+  pitchLimit: 70,   // <-- limite verticale richiesto: -70° / +70°
+  fov: 75,          // zoom iniziale
+  minFov: 30,        // massimo zoom in avanti
+  maxFov: 100,        // massimo zoom indietro (grandangolo)
+  autoRotate: false
+});
+</script>
+</body>
+</html>
